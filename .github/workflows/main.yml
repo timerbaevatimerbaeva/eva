@@ -1,0 +1,160 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: ci-chain
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare folders
+        run: |
+          New-Item -ItemType Directory -Path C:\9Hits -Force
+
+      # 📦 Кэш ZIP
+      - name: Restore ZIP cache
+        id: cache-zip
+        uses: actions/cache@v4
+        with:
+          path: |
+            hits.zip
+            state.zip
+          key: zip-cache-v3
+
+      # ⬇️ скачивание только при отсутствии кэша
+      - name: Download main package
+        if: steps.cache-zip.outputs.cache-hit != 'true'
+        run: |
+          Invoke-WebRequest 'https://www.dropbox.com/scl/fi/rjq13h7xcixhs2emmelfl/35-45.zip?rlkey=hltasaaypc7ntld4ri33k2hhe&st=qpbng7gp&dl=1' -OutFile hits.zip
+
+      - name: Download state package
+        if: steps.cache-zip.outputs.cache-hit != 'true'
+        run: |
+          Invoke-WebRequest 'https://www.dropbox.com/scl/fi/cvt5rjr21vvwogj2chafr/app.zip?rlkey=iltboar3cyj1ioru8mu53fteo&st=yumm3l59&dl=1' -OutFile state.zip
+
+      - name: Place ZIPs
+        run: |
+          Copy-Item hits.zip C:\9Hits\hits.zip -Force
+          Copy-Item state.zip C:\9Hits\state.zip -Force
+
+      - name: Extract main package
+        run: |
+          Expand-Archive C:\9Hits\hits.zip C:\9Hits -Force
+
+      - name: Restore state
+        run: |
+          $local="$env:LOCALAPPDATA\9hits-app"
+
+          Remove-Item $local -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item $local -ItemType Directory -Force
+
+          $tmp="C:\9Hits\temp"
+          New-Item $tmp -ItemType Directory -Force
+
+          Expand-Archive C:\9Hits\state.zip $tmp -Force
+
+          if (Test-Path "$tmp\9hits-app") {
+            Copy-Item "$tmp\9hits-app\*" $local -Recurse -Force
+          } else {
+            Copy-Item "$tmp\*" $local -Recurse -Force
+          }
+
+          Remove-Item $tmp -Recurse -Force
+          
+      - name: Run with internal restart
+        run: |
+          $exe = Get-ChildItem C:\9Hits -Recurse -Filter "9hits.exe" | Select-Object -First 1
+      
+          if (!$exe) {
+            Write-Host "9hits.exe not found"
+            exit 1
+          }
+      
+          $exePath = $exe.FullName
+      
+          # общий лимит работы job
+          $end = (Get-Date).AddMinutes(120)
+      
+          while ((Get-Date) -lt $end) {
+            Write-Host "Starting..."
+      
+            $proc = Start-Process $exePath -PassThru
+      
+            # один запуск работает 30 минут
+            Start-Sleep 1800
+      
+            if (!$proc.HasExited) {
+              Write-Host "Stopping 9hits..."
+      
+              try {
+                $proc.CloseMainWindow() | Out-Null
+                Start-Sleep 5
+              } catch {}
+      
+              if (!$proc.HasExited) {
+                Write-Host "Force kill 9hits"
+                $proc.Kill()
+              }
+            }
+      
+            Write-Host "Restart after 5 sec..."
+            Start-Sleep 5
+          }
+
+
+      
+          
+
+      - name: Resource usage summary
+        if: always()
+        run: |
+          Write-Host "Runner stats"
+
+          $cpuSamples=Get-Counter "\Processor(_Total)\% Processor Time" -SampleInterval 1 -MaxSamples 5
+          $vals=$cpuSamples.CounterSamples | ForEach-Object {$_.CookedValue}
+
+          $cpuAvg=[math]::Round(($vals|Measure-Object -Average).Average,1)
+          $cpuMax=[math]::Round(($vals|Measure-Object -Maximum).Maximum,1)
+
+          $memFree=(Get-Counter "\Memory\Available MBytes").CounterSamples.CookedValue
+          $memTotal=(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory/1MB
+          $memUsed=$memTotal-$memFree
+
+          Write-Host "CPU avg $cpuAvg%"
+          Write-Host "CPU peak $cpuMax%"
+          Write-Host ("RAM used {0:N2} MB free {1:N2} MB total {2:N2} MB" -f $memUsed,$memFree,$memTotal)
+
+
+      - name: Trigger next run
+        if: always()
+        run: |
+          Start-Sleep 58
+
+          $body = @{
+            ref = "main"
+          } | ConvertTo-Json
+
+          Invoke-RestMethod `
+            -Method POST `
+            -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/main.yml/dispatches" `
+            -Headers @{
+              Authorization = "Bearer $env:GITHUB_TOKEN"
+              Accept = "application/vnd.github+json"
+            } `
+            -Body $body
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
